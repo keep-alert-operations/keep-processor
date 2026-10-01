@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.local/
+.env
+.env.*
+!.env.example
+dist/
+wheelhouse/
+node_modules/
+.next*/
+test-results*/
+playwright-report/
+*.tsbuildinfo
+*.log

@@ -1,0 +1,6 @@
+* text=auto
+*.sql -text
+*.png -text
+*.woff2 -text
+
+*.sh text eol=lf

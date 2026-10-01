@@ -1,0 +1,26 @@
+name: Checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.8"
+      - name: Authenticate private dependencies
+        env:
+          APPCHI_TOKEN: ${{ secrets.APPCHI_REPOSITORIES_TOKEN }}
+        run: |
+          test -n "$APPCHI_TOKEN" || { echo 'Configure APPCHI_REPOSITORIES_TOKEN with read access to the Appchi repositories.'; exit 1; }
+          git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$APPCHI_TOKEN"; }; f'
+      - name: Locked install and checks
+        env:
+          APPCHI_TOKEN: ${{ secrets.APPCHI_REPOSITORIES_TOKEN }}
+        run: |
+          uv sync --locked --all-extras
+          uv run --locked ruff check src tests
+          if [ -d tests/unit ]; then uv run --locked pytest tests/unit -q; fi
+          uv build --wheel
