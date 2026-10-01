@@ -5,7 +5,7 @@ from hashlib import sha256
 from uuid import UUID
 
 from appchi.event_models import KafkaReceivedEnvelope
-from appchi.ingestion.kafka_admission import received_key
+from appchi.ingestion.keys import received_key
 from appchi.ingestion.native import identity, parse_json, validate_native
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import coordinator
