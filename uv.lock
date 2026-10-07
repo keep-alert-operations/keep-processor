@@ -89,7 +89,7 @@ wheels = [
 [[package]]
 name = "appchi-contracts"
 version = "0.1.0"
-source = { git = "https://github.com/appchi-alert-operations/appchi-contracts.git?rev=42107e3814a07518878291929740f5fa120fbff1#42107e3814a07518878291929740f5fa120fbff1" }
+source = { git = "https://github.com/appchi-alert-operations/appchi-contracts.git?rev=eb555e8bd307c2dbc3f20a9134351696a4f5eba2#eb555e8bd307c2dbc3f20a9134351696a4f5eba2" }
 dependencies = [
     { name = "pydantic" },
 ]
@@ -97,7 +97,7 @@ dependencies = [
 [[package]]
 name = "appchi-domain"
 version = "0.1.0"
-source = { git = "https://github.com/appchi-alert-operations/appchi-domain.git?rev=830d4f65556d93692cca60695fafb522769fe122#830d4f65556d93692cca60695fafb522769fe122" }
+source = { git = "https://github.com/appchi-alert-operations/appchi-domain.git?rev=b8461620318c5dff6197094cfc9ea967c7073b01#b8461620318c5dff6197094cfc9ea967c7073b01" }
 dependencies = [
     { name = "appchi-contracts" },
     { name = "cryptography" },
@@ -137,7 +137,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "appchi-domain", extras = ["runtime"], git = "https://github.com/appchi-alert-operations/appchi-domain.git?rev=830d4f65556d93692cca60695fafb522769fe122" }]
+requires-dist = [{ name = "appchi-domain", extras = ["runtime"], git = "https://github.com/appchi-alert-operations/appchi-domain.git?rev=b8461620318c5dff6197094cfc9ea967c7073b01" }]
 
 [package.metadata.requires-dev]
 dev = [
