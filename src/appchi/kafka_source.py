@@ -3,12 +3,16 @@
 from datetime import datetime
 from hashlib import sha256
 from uuid import UUID
+import logging
 
 from appchi.event_models import KafkaReceivedEnvelope
 from appchi.ingestion.keys import received_key
 from appchi.ingestion.native import identity, parse_json, validate_native
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import coordinator
+from appchi.kafka_changed import PartitionRetries
+
+log = logging.getLogger(__name__)
 
 
 def apply_record(db, *, topic, partition, offset, key, value, settings, profile):
@@ -29,89 +33,151 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
     ):
         raise unavailable("source_identity_proof_invalid")
     digest = sha256(value).digest()
-    from appchi.alerts.processor import _apply_one
     from appchi.maintenance.runtime import prepare_for_tenant
 
+    at = datetime.fromisoformat(envelope.received_at.replace("Z", "+00:00"))
+    application = dict(
+        tenant=tenant,
+        envelope=envelope,
+        payload=payload,
+        key_digest=key_digest,
+        material=material,
+        logical_key=logical_key,
+        at=at,
+        digest=digest,
+        topic=topic,
+        partition=partition,
+        offset=offset,
+    )
     with db.transaction(tenant) as conn:
         old = conn.execute(
             "SELECT * FROM kafka_source_results WHERE delivery_id=%s", (envelope.event_id,)
         ).fetchone()
         if old:
             return replay_result(old, tenant, digest, topic, partition, offset)
-    catalog = prepare_for_tenant(db, tenant, profile)
-    with db.transaction(tenant) as conn:
-        coordinator(conn, tenant)
-        old = conn.execute(
-            "SELECT * FROM kafka_source_results WHERE delivery_id=%s", (envelope.event_id,)
+        maintenance_gate = conn.execute(
+            "SELECT ready FROM capability_gates WHERE capability='maintenance'"
         ).fetchone()
-        if old:
-            return replay_result(old, tenant, digest, topic, partition, offset)
-        operator = None
-        if envelope.operator_id:
-            operator = conn.execute(
-                "SELECT deleted_at FROM operators WHERE id=%s AND tenant_id=%s",
-                (envelope.operator_id, tenant),
-            ).fetchone()
-            if not operator:
-                raise unavailable("source_operator_scope_invalid")
-        order = conn.execute(
-            "UPDATE tenant_work_state SET admission_order=admission_order+1 WHERE tenant_id=%s RETURNING admission_order",
-            (tenant,),
-        ).fetchone()["admission_order"]
-        at = datetime.fromisoformat(envelope.received_at.replace("Z", "+00:00"))
-        retired = conn.execute(
-            "SELECT retired_at FROM alert_retired_keys WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
+        if not maintenance_gate or not maintenance_gate["ready"]:
+            # No native preparation is needed. Keep the already acquired restore
+            # guard and transaction; the locked domain path still rechecks the
+            # live gate/timeline and rolls back if the gate changed meanwhile.
+            return _apply_record_locked(conn, catalog=None, **application)
+        claim = conn.execute(
+            "SELECT alert_id FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
             (tenant, envelope.native_version, key_digest),
         ).fetchone()
-        if operator and operator["deleted_at"]:
-            # A bounded acknowledged-delivery drain precedes deletion. A later
-            # unconfirmed broker write must not resurrect a deleted operator's
-            # owned resources; preserve its terminal operational outcome.
-            result = {"alert_id": None, "error_code": "operator_deleted", "envelope": None}
-        elif retired and at <= retired["retired_at"]:
-            result = {"alert_id": None, "error_code": "retired_receipt", "envelope": None}
-        else:
-            result = _apply_one(
-                conn,
-                tenant,
-                None,
-                catalog,
-                supplied_item={
-                    "id": UUID(envelope.event_id),
-                    "tenant_id": tenant,
-                    "operator_id": UUID(envelope.operator_id) if envelope.operator_id else None,
-                    "version": envelope.native_version,
-                    "key_field": logical_key,
-                    "key_digest": key_digest,
-                    "identity_material": material,
-                    "received_at": at,
-                    "admission_order": order,
-                    "payload": payload,
-                    "raw_json": envelope.raw_json.encode(),
-                    "time_defaulted": envelope.time_defaulted,
-                    "adapter_version": envelope.adapter_version,
-                },
-            )
-        conn.execute(
-            """INSERT INTO kafka_source_results(delivery_id,tenant_id,topic,partition,input_offset,input_digest,received_at,alert_id,outcome,error_code,changed_envelope,changed_event_id,application_order)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (
-                envelope.event_id,
-                tenant,
-                topic,
-                partition,
-                offset,
-                digest,
-                at,
-                result["alert_id"],
-                "rejected" if result["error_code"] else "applied",
-                result["error_code"],
-                result["envelope"],
-                parse_json(result["envelope"])["event_id"] if result["envelope"] else None,
-                order,
-            ),
+    catalog = prepare_for_tenant(
+        db,
+        tenant,
+        profile,
+        gate_ready=bool(maintenance_gate and maintenance_gate["ready"]),
+        alert_id=claim["alert_id"] if claim else None,
+        effective_at=at,
+        source_item={
+            "id": UUID(envelope.event_id),
+            "tenant_id": tenant,
+            "version": envelope.native_version,
+            "key_field": logical_key,
+            "operator_id": UUID(envelope.operator_id) if envelope.operator_id else None,
+            "received_at": at,
+            "payload": payload,
+        },
+    )
+    with db.transaction(tenant) as conn:
+        return _apply_record_locked(conn, catalog=catalog, **application)
+
+
+def _apply_record_locked(
+    conn,
+    *,
+    tenant,
+    envelope,
+    payload,
+    key_digest,
+    material,
+    logical_key,
+    at,
+    digest,
+    topic,
+    partition,
+    offset,
+    catalog,
+):
+    """Apply validated delivery and proof in the caller's guarded transaction."""
+    from appchi.alerts.processor import _apply_one
+
+    coordinator(conn, tenant)
+    old = conn.execute(
+        "SELECT * FROM kafka_source_results WHERE delivery_id=%s", (envelope.event_id,)
+    ).fetchone()
+    if old:
+        return replay_result(old, tenant, digest, topic, partition, offset)
+    operator = None
+    if envelope.operator_id:
+        operator = conn.execute(
+            "SELECT deleted_at FROM operators WHERE id=%s AND tenant_id=%s",
+            (envelope.operator_id, tenant),
+        ).fetchone()
+        if not operator:
+            raise unavailable("source_operator_scope_invalid")
+    order = conn.execute(
+        "UPDATE tenant_work_state SET admission_order=admission_order+1 WHERE tenant_id=%s RETURNING admission_order",
+        (tenant,),
+    ).fetchone()["admission_order"]
+    retired = conn.execute(
+        "SELECT retired_at FROM alert_retired_keys WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
+        (tenant, envelope.native_version, key_digest),
+    ).fetchone()
+    if operator and operator["deleted_at"]:
+        # A bounded acknowledged-delivery drain precedes deletion. A later
+        # unconfirmed broker write must not resurrect a deleted operator's
+        # owned resources; preserve its terminal operational outcome.
+        result = {"alert_id": None, "error_code": "operator_deleted", "envelope": None}
+    elif retired and at <= retired["retired_at"]:
+        result = {"alert_id": None, "error_code": "retired_receipt", "envelope": None}
+    else:
+        result = _apply_one(
+            conn,
+            tenant,
+            None,
+            catalog,
+            supplied_item={
+                "id": UUID(envelope.event_id),
+                "tenant_id": tenant,
+                "operator_id": UUID(envelope.operator_id) if envelope.operator_id else None,
+                "version": envelope.native_version,
+                "key_field": logical_key,
+                "key_digest": key_digest,
+                "identity_material": material,
+                "received_at": at,
+                "admission_order": order,
+                "payload": payload,
+                "raw_json": envelope.raw_json.encode(),
+                "time_defaulted": envelope.time_defaulted,
+                "adapter_version": envelope.adapter_version,
+            },
         )
-        return result["envelope"]
+    conn.execute(
+        """INSERT INTO kafka_source_results(delivery_id,tenant_id,topic,partition,input_offset,input_digest,received_at,alert_id,outcome,error_code,changed_envelope,changed_event_id,application_order)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (
+            envelope.event_id,
+            tenant,
+            topic,
+            partition,
+            offset,
+            digest,
+            at,
+            result["alert_id"],
+            "rejected" if result["error_code"] else "applied",
+            result["error_code"],
+            result["envelope"],
+            parse_json(result["envelope"])["event_id"] if result["envelope"] else None,
+            order,
+        ),
+    )
+    return result["envelope"]
 
 
 def replay_result(old, tenant, digest, topic, partition, offset):
@@ -157,6 +223,7 @@ class SourceConsumer:
                 "partition.assignment.strategy": "range",
             }
         )
+        self.retries = PartitionRetries(self.client)
         self.client.subscribe(
             [f"appchi.{settings.environment}.alerts.received"],
             on_assign=self._assigned,
@@ -178,6 +245,7 @@ class SourceConsumer:
         ):
             raise unavailable("kafka_partition_topology_changed")
 
+        fenced = []
         for p in partitions:
             producer = Producer(
                 {
@@ -193,8 +261,6 @@ class SourceConsumer:
             committed = consumer.committed([p], timeout=5)[0].offset
             low, _ = consumer.get_watermark_offsets(p, timeout=5)
             if committed < 0:
-                if low != 0:
-                    raise unavailable("kafka_initial_retention_gap")
                 committed = 0
             if committed < low:
                 with self.db.transaction() as conn:
@@ -202,7 +268,9 @@ class SourceConsumer:
                         "INSERT INTO kafka_pipeline_faults(consumer,topic,partition,input_offset,reason) VALUES('source',%s,%s,%s,'retention_gap') ON CONFLICT DO NOTHING",
                         (p.topic, p.partition, committed),
                     )
-                raise unavailable("kafka_retention_gap")
+                p.offset = low
+                fenced.append(p)
+                continue
             with self.db.transaction() as conn:
                 conn.execute(
                     "UPDATE kafka_source_results SET kafka_confirmed=true WHERE topic=%s AND partition=%s AND input_offset<%s AND NOT kafka_confirmed",
@@ -210,8 +278,11 @@ class SourceConsumer:
                 )
             p.offset = committed
         consumer.assign(partitions)
+        for point in fenced:
+            self.retries.fence(point)
 
     def _revoked(self, consumer, partitions):
+        self.retries.revoke(partitions)
         for p in partitions:
             self.producers.pop(p.partition, None)
 
@@ -220,6 +291,7 @@ class SourceConsumer:
         from appchi.clock_health import require_clock_health
 
         require_clock_health(self.settings)
+        self.retries.resume_due()
 
         message = self.client.poll(0.1)
         if message is None:
@@ -238,7 +310,7 @@ class SourceConsumer:
                 settings=self.settings,
                 profile=self.profile,
             )
-        except (AppError, ValueError) as error:
+        except Exception as error:
             # Independent diagnostic transaction: do not roll this evidence back
             # with a failed domain mutation or persist arbitrary exception text.
             known = {
@@ -265,7 +337,13 @@ class SourceConsumer:
                         sha256(message.value()).digest(),
                     ),
                 )
-            raise
+            # No Kafka transaction has begun. Retain this exact offset and
+            # continue processing unrelated assigned partitions during retry.
+            self.retries.fail(message)
+            log.warning(
+                "source_partition_retry", extra={"partition": message.partition(), "reason": reason}
+            )
+            return 0
         producer.begin_transaction()
         if changed:
             body = parse_json(changed)
