@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from hashlib import sha256
+from time import monotonic
 from uuid import UUID
 import logging
 
@@ -9,10 +10,23 @@ from appchi.event_models import KafkaReceivedEnvelope
 from appchi.ingestion.keys import received_key
 from appchi.ingestion.native import identity, parse_json, validate_native
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import coordinator
+from appchi.shared.transactions import advance_clock, lock_coordinator
 from appchi.kafka_changed import PartitionRetries
 
 log = logging.getLogger(__name__)
+
+# The clock-health contract bounds each host's offset at one second. A larger
+# receipt lead is a clock fault; a smaller one is waited out without a fault.
+RECEIVE_LEAD_LIMIT = 1.0
+RECEIVE_LEAD_MARGIN = 0.01
+
+
+class ReceiveTimeAhead(AppError):
+    """Ingress stamped a receipt ahead of the tenant clock; retry once it passes."""
+
+    def __init__(self, lead):
+        super().__init__("source_receive_time_ahead", "Receipt is ahead of the tenant clock.", 503)
+        self.lead = lead
 
 
 def apply_record(db, *, topic, partition, offset, key, value, settings, profile):
@@ -107,12 +121,22 @@ def _apply_record_locked(
     """Apply validated delivery and proof in the caller's guarded transaction."""
     from appchi.alerts.processor import _apply_one
 
-    coordinator(conn, tenant)
+    # One coordinator acquisition serves the whole source application. The
+    # clock check precedes any write and, on a first application, also
+    # allocates the admission order in the same statement.
+    state = lock_coordinator(conn, tenant)
     old = conn.execute(
         "SELECT * FROM kafka_source_results WHERE delivery_id=%s", (envelope.event_id,)
     ).fetchone()
     if old:
+        advance_clock(conn, tenant)
         return replay_result(old, tenant, digest, topic, partition, offset)
+    now, order = advance_clock(conn, tenant, admission=True)
+    if at > now:
+        # Ingress stamps receipt with its own host clock. Applied now, a later
+        # control boundary could precede this receipt and cover it on replay.
+        # Roll back, including the clock and order, and wait out the lead.
+        raise ReceiveTimeAhead((at - now).total_seconds())
     operator = None
     if envelope.operator_id:
         operator = conn.execute(
@@ -120,11 +144,8 @@ def _apply_record_locked(
             (envelope.operator_id, tenant),
         ).fetchone()
         if not operator:
+            # Rolls back the transaction, including the allocated order.
             raise unavailable("source_operator_scope_invalid")
-    order = conn.execute(
-        "UPDATE tenant_work_state SET admission_order=admission_order+1 WHERE tenant_id=%s RETURNING admission_order",
-        (tenant,),
-    ).fetchone()["admission_order"]
     retired = conn.execute(
         "SELECT retired_at FROM alert_retired_keys WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
         (tenant, envelope.native_version, key_digest),
@@ -142,6 +163,7 @@ def _apply_record_locked(
             tenant,
             None,
             catalog,
+            coordinated=(state, now),
             supplied_item={
                 "id": UUID(envelope.event_id),
                 "tenant_id": tenant,
@@ -173,7 +195,7 @@ def _apply_record_locked(
             "rejected" if result["error_code"] else "applied",
             result["error_code"],
             result["envelope"],
-            parse_json(result["envelope"])["event_id"] if result["envelope"] else None,
+            result.get("event_id"),
             order,
         ),
     )
@@ -194,10 +216,17 @@ def replay_result(old, tenant, digest, topic, partition, offset):
 class SourceConsumer:
     """One stable transactional producer per owned input partition.
 
+    Each turn applies a bounded batch per partition, one PostgreSQL proof
+    transaction per input, then publishes the batch in one Kafka transaction.
     On any uncertain transaction outcome discard this client and rejoin. A new
     init_transactions fences its predecessor and settles its transaction before
     the group offset is read. Never seek past an uncommitted database effect.
     """
+
+    # The pipeline's existing yield bound: at most 100 inputs per turn, and a
+    # partition batch closes after 100 milliseconds of application.
+    batch_records = 100
+    batch_seconds = 0.1
 
     def __init__(self, db, settings, profile):
         from confluent_kafka import Consumer
@@ -287,88 +316,137 @@ class SourceConsumer:
             self.producers.pop(p.partition, None)
 
     def turn(self):
-        from confluent_kafka import TopicPartition
         from appchi.clock_health import require_clock_health
 
         require_clock_health(self.settings)
         self.retries.resume_due()
 
-        message = self.client.poll(0.1)
-        if message is None:
-            return 0
-        if message.error():
-            raise unavailable("kafka_source_consume_failed")
-        producer = self.producers[message.partition()]
-        try:
-            changed = apply_record(
-                self.db,
-                topic=message.topic(),
-                partition=message.partition(),
-                offset=message.offset(),
-                key=message.key(),
-                value=message.value(),
-                settings=self.settings,
-                profile=self.profile,
-            )
-        except Exception as error:
-            # Independent diagnostic transaction: do not roll this evidence back
-            # with a failed domain mutation or persist arbitrary exception text.
-            known = {
-                "source_delivery_identity_conflict",
-                "source_identity_proof_invalid",
-                "source_topic_mismatch",
-                "source_global_scope_mismatch",
-                "source_operator_scope_invalid",
-                "maintenance_proof_unavailable",
-            }
-            reason = (
-                error.code
-                if isinstance(error, AppError) and error.code in known
-                else "source_processing_failed"
-            )
-            with self.db.transaction() as conn:
-                conn.execute(
-                    "INSERT INTO kafka_pipeline_faults(consumer,topic,partition,input_offset,reason,digest) VALUES('source',%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (
-                        message.topic(),
-                        message.partition(),
-                        message.offset(),
-                        reason,
-                        sha256(message.value()).digest(),
-                    ),
+        # Take already fetched inputs without waiting. Only an idle consumer
+        # waits, and then for one input, so batching adds no idle latency.
+        messages = self.client.consume(self.batch_records, timeout=0)
+        if not messages:
+            message = self.client.poll(self.retries.timeout(self.batch_seconds))
+            messages = [] if message is None else [message]
+        batches = {}
+        for message in messages:
+            if message.error():
+                raise unavailable("kafka_source_consume_failed")
+            batches.setdefault(message.partition(), []).append(message)
+        progress = 0
+        for partition, batch in batches.items():
+            # A revoked partition belongs to its next owner; a retained or fenced
+            # partition resumes only from its held offset. (A Producer defines
+            # __len__, so test identity rather than truth.)
+            producer = self.producers.get(partition)
+            if producer is not None and (batch[0].topic(), partition) not in self.retries.failed:
+                progress += self._apply_batch(producer, batch)
+        return progress
+
+    def _apply_batch(self, producer, batch):
+        applied, progress, started = [], 0, monotonic()
+        for message in batch:
+            try:
+                changed = apply_record(
+                    self.db,
+                    topic=message.topic(),
+                    partition=message.partition(),
+                    offset=message.offset(),
+                    key=message.key(),
+                    value=message.value(),
+                    settings=self.settings,
+                    profile=self.profile,
                 )
-            # No Kafka transaction has begun. Retain this exact offset and
-            # continue processing unrelated assigned partitions during retry.
-            self.retries.fail(message)
-            log.warning(
-                "source_partition_retry", extra={"partition": message.partition(), "reason": reason}
-            )
+            except Exception as error:
+                # Commit the healthy prefix before retaining this exact offset.
+                progress += self._publish(producer, applied)
+                self._retain(message, error)
+                return progress
+            applied.append((message, changed))
+            if monotonic() - started >= self.batch_seconds:
+                progress += self._publish(producer, applied)
+                applied, started = [], monotonic()
+        return progress + self._publish(producer, applied)
+
+    def _publish(self, producer, applied):
+        """Commit changed events in input order and the next offset atomically in Kafka."""
+        from confluent_kafka import TopicPartition
+
+        if not applied:
             return 0
+        first, last = applied[0][0], applied[-1][0]
+        # Every input is already committed in PostgreSQL, so the transaction
+        # timeout covers only this publication.
         producer.begin_transaction()
-        if changed:
-            body = parse_json(changed)
-            producer.produce(
-                f"appchi.{self.settings.environment}.alerts.changed",
-                key=UUID(body["tenant_id"]).bytes,
-                value=changed,
-            )
+        for _, changed in applied:
+            if changed:
+                body = parse_json(changed)
+                producer.produce(
+                    f"appchi.{self.settings.environment}.alerts.changed",
+                    key=UUID(body["tenant_id"]).bytes,
+                    value=changed,
+                )
         producer.send_offsets_to_transaction(
-            [TopicPartition(message.topic(), message.partition(), message.offset() + 1)],
+            [TopicPartition(last.topic(), last.partition(), last.offset() + 1)],
             self.client.consumer_group_metadata(),
             5,
         )
         producer.commit_transaction(10)
         with self.db.transaction() as conn:
             conn.execute(
-                "UPDATE kafka_source_results SET kafka_confirmed=true WHERE topic=%s AND partition=%s AND input_offset=%s",
-                (message.topic(), message.partition(), message.offset()),
+                "UPDATE kafka_source_results SET kafka_confirmed=true WHERE topic=%s AND partition=%s AND input_offset>=%s AND input_offset<%s AND NOT kafka_confirmed",
+                (last.topic(), last.partition(), first.offset(), last.offset() + 1),
             )
             conn.execute(
                 """INSERT INTO kafka_consumer_positions(consumer,topic,partition,next_offset) VALUES('source',%s,%s,%s)
                 ON CONFLICT(consumer,topic,partition) DO UPDATE SET next_offset=greatest(kafka_consumer_positions.next_offset,EXCLUDED.next_offset),updated_at=clock_timestamp()""",
-                (message.topic(), message.partition(), message.offset() + 1),
+                (last.topic(), last.partition(), last.offset() + 1),
             )
-        return 1
+        return len(applied)
+
+    def _retain(self, message, error):
+        if isinstance(error, ReceiveTimeAhead) and error.lead <= RECEIVE_LEAD_LIMIT:
+            # Healthy clocks still differ: hold only this partition until the
+            # tenant clock passes the receipt. Not a fault; warn above 100 ms.
+            self.retries.fail(message, delay=error.lead + RECEIVE_LEAD_MARGIN)
+            log.log(
+                logging.WARNING if error.lead > 0.1 else logging.INFO,
+                "source_receive_time_ahead",
+                extra={"partition": message.partition(), "lead_seconds": error.lead},
+            )
+            return
+        # Independent diagnostic transaction: do not roll this evidence back
+        # with a failed domain mutation or persist arbitrary exception text.
+        known = {
+            "source_delivery_identity_conflict",
+            "source_identity_proof_invalid",
+            "source_topic_mismatch",
+            "source_global_scope_mismatch",
+            "source_operator_scope_invalid",
+            "maintenance_proof_unavailable",
+            "source_receive_time_ahead",
+        }
+        reason = (
+            error.code
+            if isinstance(error, AppError) and error.code in known
+            else "source_processing_failed"
+        )
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO kafka_pipeline_faults(consumer,topic,partition,input_offset,reason,digest) VALUES('source',%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (
+                    message.topic(),
+                    message.partition(),
+                    message.offset(),
+                    reason,
+                    sha256(message.value()).digest(),
+                ),
+            )
+        # No Kafka transaction covers this offset. Retain it and continue
+        # processing unrelated assigned partitions during retry.
+        self.retries.fail(message)
+        log.warning(
+            "source_partition_retry", extra={"partition": message.partition(), "reason": reason}
+        )
 
     def close(self):
         self.closing = True

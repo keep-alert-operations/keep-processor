@@ -7,9 +7,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
         with:
-          version: "0.10.8"
+          # Let Poetry use the sibling-repository credential instead of GITHUB_TOKEN.
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Poetry
+        run: python -m pip install poetry==2.3.1
       - name: Authenticate private dependencies
         env:
           APPCHI_TOKEN: ${{ secrets.APPCHI_REPOSITORIES_TOKEN }}
@@ -20,7 +25,8 @@ jobs:
         env:
           APPCHI_TOKEN: ${{ secrets.APPCHI_REPOSITORIES_TOKEN }}
         run: |
-          uv sync --locked --all-extras
-          uv run --locked ruff check src tests
-          if [ -d tests/unit ]; then uv run --locked pytest tests/unit -q; fi
-          uv build --wheel
+          poetry check --lock
+          poetry sync --all-extras
+          poetry run ruff check src tests
+          if [ -d tests/unit ]; then poetry run pytest tests/unit -q; fi
+          poetry build --format wheel
