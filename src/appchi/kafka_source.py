@@ -29,7 +29,25 @@ class ReceiveTimeAhead(AppError):
         self.lead = lead
 
 
+class ChangedEvent(bytes):
+    """Changed-event bytes carrying the input tenant that keys their publication.
+
+    Replay proof binds a stored changed envelope to the same tenant, so the
+    publisher need not parse the envelope again to find its key.
+    """
+
+    def __new__(cls, envelope, tenant):
+        event = super().__new__(cls, envelope)
+        event.tenant = tenant
+        return event
+
+
+def _keyed(tenant, changed):
+    return None if changed is None else ChangedEvent(changed, tenant)
+
+
 def apply_record(db, *, topic, partition, offset, key, value, settings, profile):
+    """Apply one input; return its unconfirmed ``ChangedEvent`` or None."""
     envelope = KafkaReceivedEnvelope.model_validate(parse_json(value))
     tenant = UUID(envelope.tenant_id)
     if topic != f"appchi.{settings.environment}.alerts.received":
@@ -68,7 +86,7 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
             "SELECT * FROM kafka_source_results WHERE delivery_id=%s", (envelope.event_id,)
         ).fetchone()
         if old:
-            return replay_result(old, tenant, digest, topic, partition, offset)
+            return _keyed(tenant, replay_result(old, tenant, digest, topic, partition, offset))
         maintenance_gate = conn.execute(
             "SELECT ready FROM capability_gates WHERE capability='maintenance'"
         ).fetchone()
@@ -76,7 +94,7 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
             # No native preparation is needed. Keep the already acquired restore
             # guard and transaction; the locked domain path still rechecks the
             # live gate/timeline and rolls back if the gate changed meanwhile.
-            return _apply_record_locked(conn, catalog=None, **application)
+            return _keyed(tenant, _apply_record_locked(conn, catalog=None, **application))
         claim = conn.execute(
             "SELECT alert_id FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
             (tenant, envelope.native_version, key_digest),
@@ -99,7 +117,7 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
         },
     )
     with db.transaction(tenant) as conn:
-        return _apply_record_locked(conn, catalog=catalog, **application)
+        return _keyed(tenant, _apply_record_locked(conn, catalog=catalog, **application))
 
 
 def _apply_record_locked(
@@ -316,9 +334,7 @@ class SourceConsumer:
             self.producers.pop(p.partition, None)
 
     def turn(self):
-        from appchi.clock_health import require_clock_health
-
-        require_clock_health(self.settings)
+        # The worker loop checks clock health immediately before each turn.
         self.retries.resume_due()
 
         # Take already fetched inputs without waiting. Only an idle consumer
@@ -379,10 +395,9 @@ class SourceConsumer:
         producer.begin_transaction()
         for _, changed in applied:
             if changed:
-                body = parse_json(changed)
                 producer.produce(
                     f"appchi.{self.settings.environment}.alerts.changed",
-                    key=UUID(body["tenant_id"]).bytes,
+                    key=changed.tenant.bytes,
                     value=changed,
                 )
         producer.send_offsets_to_transaction(
