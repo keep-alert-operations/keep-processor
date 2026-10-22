@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Kafka source processing, immutable PostgreSQL replay proof and transactional changed-event publication."
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "appchi-domain[runtime] @ git+https://github.com/appchi-alert-operations/appchi-domain.git@6d4cfa6f1acf11ef3a369a002f0cceb99bab2e3c"
+  "appchi-domain[runtime] @ git+https://github.com/appchi-alert-operations/appchi-domain.git@d4fb748ca199cdf75a42544f6a3aeb4f358a9e77"
 ]
 
 [dependency-groups]
