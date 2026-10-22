@@ -391,7 +391,9 @@ class SourceConsumer:
             5,
         )
         producer.commit_transaction(10)
-        with self.db.transaction() as conn:
+        # Neither write selects REPEATABLE READ, so the restore guard runs
+        # inside this transaction instead of around it.
+        with self.db.transaction(read_committed=True) as conn:
             conn.execute(
                 "UPDATE kafka_source_results SET kafka_confirmed=true WHERE topic=%s AND partition=%s AND input_offset>=%s AND input_offset<%s AND NOT kafka_confirmed",
                 (last.topic(), last.partition(), first.offset(), last.offset() + 1),
