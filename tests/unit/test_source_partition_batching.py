@@ -48,7 +48,7 @@ class Database:
         self.transactions = []
 
     @contextmanager
-    def transaction(self, *args):
+    def transaction(self, *args, **kwargs):
         conn = Mock()
         self.transactions.append(conn)
         yield conn
@@ -327,7 +327,7 @@ def test_replay_at_same_coordinate_reemits_stored_bytes_once_unconfirmed(monkeyp
     duplicate = record(0, 60, value=batch[0].value())
     second = source(monkeypatch, [batch, [duplicate]], apply, partitions=(0,))
     second.db.transaction = contextmanager(
-        lambda *args: (yield Mock(execute=Mock(side_effect=execute)))
+        lambda *args, **kwargs: (yield Mock(execute=Mock(side_effect=execute)))
     )
     assert second.turn() == 2
     names, values, offsets = transaction(second.producers[0])
