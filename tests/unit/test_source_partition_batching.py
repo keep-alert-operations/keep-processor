@@ -33,9 +33,12 @@ def record(partition, offset, value=None):
 
 
 def changed(partition, offset):
-    return json.dumps(
-        {"tenant_id": str(TENANT), "event_id": str(uuid4()), "input": [partition, offset]}
-    ).encode()
+    return kafka_source.ChangedEvent(
+        json.dumps(
+            {"tenant_id": str(TENANT), "event_id": str(uuid4()), "input": [partition, offset]}
+        ).encode(),
+        TENANT,
+    )
 
 
 class Database:
@@ -55,7 +58,7 @@ class Database:
 
 
 def source(monkeypatch, fetches, apply, partitions=(0, 1)):
-    monkeypatch.setattr(clock_health, "require_clock_health", lambda *args: None)
+    monkeypatch.setattr(clock_health, "require_clock_health", Mock(side_effect=AssertionError))
     monkeypatch.setattr(kafka_source, "apply_record", Mock(side_effect=apply))
     monkeypatch.setattr(kafka_source, "monotonic", lambda: 0.0)
     worker = SourceConsumer.__new__(SourceConsumer)
@@ -287,17 +290,20 @@ def test_replay_at_same_coordinate_reemits_stored_bytes_once_unconfirmed(monkeyp
     def apply(db, *, topic, partition, offset, value, **_):
         digest = sha256(value).digest()
         if value in rows:
-            return kafka_source.replay_result(rows[value], TENANT, digest, topic, partition, offset)
+            return kafka_source._keyed(
+                TENANT,
+                kafka_source.replay_result(rows[value], TENANT, digest, topic, partition, offset),
+            )
         rows[value] = {
             "input_digest": digest,
             "tenant_id": TENANT,
             "topic": topic,
             "partition": partition,
             "input_offset": offset,
-            "changed_envelope": changed(partition, offset),
+            "changed_envelope": bytes(changed(partition, offset)),
             "kafka_confirmed": False,
         }
-        return rows[value]["changed_envelope"]
+        return kafka_source._keyed(TENANT, rows[value]["changed_envelope"])
 
     def execute(sql, params):
         if "SET kafka_confirmed" in sql:
@@ -354,3 +360,34 @@ def test_replay_result_returns_bytes_only_at_unconfirmed_original_coordinate():
         with pytest.raises(AppError) as raised:
             replay(row, *args, TOPIC, 0, 7)
         assert raised.value.code == "source_delivery_identity_conflict"
+
+
+def test_turn_leaves_clock_health_to_the_worker_loop(monkeypatch):
+    # source() makes any clock-health call fail; the worker loop owns that check.
+    worker = source(monkeypatch, [[record(0, 1)]], lambda db, **_: None)
+    assert worker.turn() == 1
+    clock_health.require_clock_health.assert_not_called()
+
+
+def test_changed_event_is_keyed_by_the_applied_record_tenant(monkeypatch):
+    tenants = {0: uuid4(), 1: uuid4()}
+
+    def apply(db, *, partition, offset, **_):
+        # Opaque bytes: publication must not parse the envelope for its key.
+        return kafka_source.ChangedEvent(b"opaque-%d" % offset, tenants[partition])
+
+    worker = source(monkeypatch, [[record(0, 3), record(1, 4)]], apply)
+    assert worker.turn() == 2
+    for partition, offset in ((0, 3), (1, 4)):
+        call = worker.producers[partition].produce.call_args
+        assert call.kwargs["key"] == tenants[partition].bytes
+        assert call.kwargs["value"] == b"opaque-%d" % offset
+
+
+def test_apply_record_carries_the_input_tenant_on_every_result_path(monkeypatch):
+    tenant = uuid4()
+    for returned in (b"{}", None):
+        assert kafka_source._keyed(tenant, returned) == returned
+    event = kafka_source._keyed(tenant, b'{"tenant_id": "x"}')
+    assert isinstance(event, bytes) and event.tenant == tenant
+    assert json.loads(event) == {"tenant_id": "x"}

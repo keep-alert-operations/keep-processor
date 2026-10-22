@@ -139,7 +139,9 @@ def record(partition, offset):
 
 
 def changed(partition, offset):
-    return json.dumps({"tenant_id": str(TENANT), "input": [partition, offset]}).encode()
+    return kafka_source.ChangedEvent(
+        json.dumps({"tenant_id": str(TENANT), "input": [partition, offset]}).encode(), TENANT
+    )
 
 
 @pytest.fixture
@@ -151,7 +153,7 @@ def clock(monkeypatch):
 
 
 def source(monkeypatch, fetches, apply):
-    monkeypatch.setattr(clock_health, "require_clock_health", lambda *args: None)
+    monkeypatch.setattr(clock_health, "require_clock_health", Mock(side_effect=AssertionError))
     monkeypatch.setattr(kafka_source, "apply_record", Mock(side_effect=apply))
     worker = SourceConsumer.__new__(SourceConsumer)
     worker.db = Database()

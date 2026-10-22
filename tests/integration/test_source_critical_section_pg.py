@@ -6,7 +6,7 @@ Run with APPCHI_TEST_DATABASE_URL pointing at a disposable database.
 from datetime import UTC, datetime, timedelta
 import json
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -157,6 +157,8 @@ def test_source_application_folds_counters_and_keeps_results(real_db, v1, counte
     assert after["projection_seq"] == before["projection_seq"] + 1
     assert before["last_clock"] is None or after["last_clock"] > before["last_clock"]
     changed = json.loads(envelope)
+    # The publication key travels with the result; it is the envelope's tenant.
+    assert envelope.tenant == UUID(str(tenant)) == UUID(changed["tenant_id"])
     assert changed["projection_seq"] == str(after["projection_seq"])
     assert changed["original_admission_order"] == str(after["admission_order"])
     delivery = json.loads(first[2])["event_id"]
@@ -184,7 +186,8 @@ def test_source_application_folds_counters_and_keeps_results(real_db, v1, counte
 
     # Same delivery and offset: the unlocked precheck returns the retained
     # result; the locked replay branch is covered by the unit tests.
-    assert apply(real_db, config, first, 0) == envelope
+    replay = apply(real_db, config, first, 0)
+    assert replay == envelope and replay.tenant == envelope.tenant
     assert len(counted) == 1
     replayed = work(real_db, tenant)
     assert replayed == after
