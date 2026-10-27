@@ -1,10 +1,13 @@
 """Kafka source transactions; PostgreSQL and Kafka are deliberately separate commits."""
 
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime
 from hashlib import sha256
 from time import monotonic
 from uuid import UUID
 import logging
+
+from psycopg.errors import UniqueViolation
 
 from appchi.event_models import KafkaReceivedEnvelope
 from appchi.ingestion.keys import received_key
@@ -19,6 +22,45 @@ log = logging.getLogger(__name__)
 # receipt lead is a clock fault; a smaller one is waited out without a fault.
 RECEIVE_LEAD_LIMIT = 1.0
 RECEIVE_LEAD_MARGIN = 0.01
+
+# UNIQUE(topic,partition,input_offset) of kafka_source_results (migration 0040).
+COORDINATE_KEY = "kafka_source_results_topic_partition_input_offset_key"
+HALF = (1 << 64) - 1
+
+
+def topic_identity(admin, topic):
+    """Return the broker's topic ID as Kafka's tools print it.
+
+    The text is unpadded URL-safe base64 of the 16 ID bytes, built from the
+    client's two 64-bit halves. A broker without topic IDs reports zero.
+    """
+    from confluent_kafka import KafkaException, TopicCollection
+
+    try:
+        description = admin.describe_topics(TopicCollection([topic]), request_timeout=5)[
+            topic
+        ].result(6)
+    except KafkaException:
+        raise unavailable("kafka_topic_identity_unverified") from None
+    uuid = description.topic_id
+    value = (uuid.get_most_significant_bits() & HALF) << 64 | (
+        uuid.get_least_significant_bits() & HALF
+    )
+    if not value:
+        raise unavailable("kafka_topic_identity_unavailable")
+    return urlsafe_b64encode(value.to_bytes(16, "big")).rstrip(b"=").decode()
+
+
+def same_topic(recorded, observed):
+    """Compare topic IDs by the bits every supported client reports.
+
+    confluent-kafka passes each 64-bit half through a C long, which is 32 bits
+    on Windows, so there it reports only the low 32 bits of each half, sign
+    extended. Topic IDs are random, so those 64 bits still identify a topic
+    incarnation, and an ID recorded on one platform compares on another.
+    """
+    first, second = (urlsafe_b64decode(value + "==") for value in (recorded, observed))
+    return first[4:8] + first[12:16] == second[4:8] + second[12:16]
 
 
 class ReceiveTimeAhead(AppError):
@@ -87,14 +129,6 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
         ).fetchone()
         if old:
             return _keyed(tenant, replay_result(old, tenant, digest, topic, partition, offset))
-        maintenance_gate = conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='maintenance'"
-        ).fetchone()
-        if not maintenance_gate or not maintenance_gate["ready"]:
-            # No native preparation is needed. Keep the already acquired restore
-            # guard and transaction; the locked domain path still rechecks the
-            # live gate/timeline and rolls back if the gate changed meanwhile.
-            return _keyed(tenant, _apply_record_locked(conn, catalog=None, **application))
         claim = conn.execute(
             "SELECT alert_id FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
             (tenant, envelope.native_version, key_digest),
@@ -103,7 +137,6 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
         db,
         tenant,
         profile,
-        gate_ready=bool(maintenance_gate and maintenance_gate["ready"]),
         alert_id=claim["alert_id"] if claim else None,
         effective_at=at,
         source_item={
@@ -198,25 +231,33 @@ def _apply_record_locked(
                 "adapter_version": envelope.adapter_version,
             },
         )
-    conn.execute(
-        """INSERT INTO kafka_source_results(delivery_id,tenant_id,topic,partition,input_offset,input_digest,received_at,alert_id,outcome,error_code,changed_envelope,changed_event_id,application_order)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (
-            envelope.event_id,
-            tenant,
-            topic,
-            partition,
-            offset,
-            digest,
-            at,
-            result["alert_id"],
-            "rejected" if result["error_code"] else "applied",
-            result["error_code"],
-            result["envelope"],
-            result.get("event_id"),
-            order,
-        ),
-    )
+    try:
+        conn.execute(
+            """INSERT INTO kafka_source_results(delivery_id,tenant_id,topic,partition,input_offset,input_digest,received_at,alert_id,outcome,error_code,changed_envelope,changed_event_id,application_order)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                envelope.event_id,
+                tenant,
+                topic,
+                partition,
+                offset,
+                digest,
+                at,
+                result["alert_id"],
+                "rejected" if result["error_code"] else "applied",
+                result["error_code"],
+                result["envelope"],
+                result.get("event_id"),
+                order,
+            ),
+        )
+    except UniqueViolation as error:
+        if error.diag.constraint_name != COORDINATE_KEY:
+            raise
+        # Under the coordinator this delivery has no result, so another delivery
+        # holds the coordinate: the broker log is not the one PostgreSQL proved
+        # (for example a recreated topic). Roll back; this is unknown proof.
+        raise unavailable("source_coordinate_conflict") from None
     return result["envelope"]
 
 
@@ -248,6 +289,7 @@ class SourceConsumer:
 
     def __init__(self, db, settings, profile):
         from confluent_kafka import Consumer
+        from confluent_kafka.admin import AdminClient
         from appchi.service_clients import kafka_options
 
         self.db, self.settings, self.profile = db, settings, profile
@@ -259,6 +301,7 @@ class SourceConsumer:
                 raise unavailable("kafka_cutover_required")
         self.producers = {}
         self.closing = False
+        self.admin = AdminClient(kafka_options(settings))
         self.client = Consumer(
             {
                 **kafka_options(settings),
@@ -283,13 +326,10 @@ class SourceConsumer:
         from confluent_kafka import Producer
         from appchi.service_clients import kafka_options
 
-        metadata = consumer.list_topics(
-            f"appchi.{self.settings.environment}.alerts.received", timeout=5
-        )
-        if (
-            len(metadata.topics[f"appchi.{self.settings.environment}.alerts.received"].partitions)
-            != self.control["received_partitions"]
-        ):
+        topic = f"appchi.{self.settings.environment}.alerts.received"
+        self._require_topic_identity(consumer, topic, partitions)
+        metadata = consumer.list_topics(topic, timeout=5)
+        if len(metadata.topics[topic].partitions) != self.control["received_partitions"]:
             raise unavailable("kafka_partition_topology_changed")
 
         fenced = []
@@ -327,6 +367,35 @@ class SourceConsumer:
         consumer.assign(partitions)
         for point in fenced:
             self.retries.fence(point)
+
+    def _require_topic_identity(self, consumer, topic, partitions):
+        """Refuse an assignment unless the topic is the incarnation recorded at cutover.
+
+        A recreated topic restarts its offsets under existing replay proof. No
+        producer, offset or input of this assignment is used before this check.
+        """
+        # Absent before migration 0054: no incarnation is recorded either way.
+        recorded = self.control.get("received_topic_id")
+        if recorded is None:
+            log.error("source_topic_identity_unrecorded topic=%s", topic)
+            raise unavailable("kafka_topic_identity_unrecorded")
+        observed = topic_identity(self.admin, topic)
+        if same_topic(recorded, observed):
+            return
+        committed = consumer.committed(partitions, timeout=5)
+        with self.db.transaction() as conn:
+            for point in committed:
+                conn.execute(
+                    "INSERT INTO kafka_pipeline_faults(consumer,topic,partition,input_offset,reason) VALUES('source',%s,%s,%s,'source_topic_identity_changed') ON CONFLICT DO NOTHING",
+                    (point.topic, point.partition, max(0, point.offset)),
+                )
+        log.error(
+            "source_topic_identity_changed topic=%s recorded=%s observed=%s",
+            topic,
+            recorded,
+            observed,
+        )
+        raise unavailable("source_topic_identity_changed")
 
     def _revoked(self, consumer, partitions):
         self.retries.revoke(partitions)
@@ -427,13 +496,15 @@ class SourceConsumer:
             self.retries.fail(message, delay=error.lead + RECEIVE_LEAD_MARGIN)
             log.log(
                 logging.WARNING if error.lead > 0.1 else logging.INFO,
-                "source_receive_time_ahead",
-                extra={"partition": message.partition(), "lead_seconds": error.lead},
+                "source_receive_time_ahead partition=%d lead_seconds=%.3f",
+                message.partition(),
+                error.lead,
             )
             return
         # Independent diagnostic transaction: do not roll this evidence back
         # with a failed domain mutation or persist arbitrary exception text.
         known = {
+            "source_coordinate_conflict",
             "source_delivery_identity_conflict",
             "source_identity_proof_invalid",
             "source_topic_mismatch",
@@ -446,6 +517,16 @@ class SourceConsumer:
             error.code
             if isinstance(error, AppError) and error.code in known
             else "source_processing_failed"
+        )
+        # Only controlled identifiers: never exception text, which can carry
+        # payload values (a constraint violation quotes its key, for example).
+        # No log handler is configured, so the fields belong in the message.
+        fields = (
+            message.partition(),
+            message.offset(),
+            reason,
+            f"{type(error).__module__}.{type(error).__qualname__}",
+            error.code if isinstance(error, AppError) else getattr(error, "sqlstate", None) or "-",
         )
         with self.db.transaction() as conn:
             conn.execute(
@@ -460,9 +541,19 @@ class SourceConsumer:
             )
         # No Kafka transaction covers this offset. Retain it and continue
         # processing unrelated assigned partitions during retry.
+        if reason == "source_coordinate_conflict":
+            # Unknown proof fences the partition for explicit repair: hold this
+            # offset with no retry deadline until a reviewed reset and restart.
+            self.retries.fail(message, delay=float("inf"))
+            log.error(
+                "source_partition_fenced partition=%d offset=%d reason=%s error_class=%s error_code=%s",
+                *fields,
+            )
+            return
         self.retries.fail(message)
         log.warning(
-            "source_partition_retry", extra={"partition": message.partition(), "reason": reason}
+            "source_partition_retry partition=%d offset=%d reason=%s error_class=%s error_code=%s",
+            *fields,
         )
 
     def close(self):

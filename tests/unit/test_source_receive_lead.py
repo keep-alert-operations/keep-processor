@@ -205,9 +205,9 @@ def test_small_lead_holds_only_its_partition_for_the_lead_without_a_fault(
     # Two bookkeeping transactions (one per partition) and no fault row.
     statements = [text for conn in worker.db.statements() for text, *_ in conn]
     assert not [text for text in statements if "kafka_pipeline_faults" in text]
-    (entry,) = [r for r in caplog.records if r.getMessage() == "source_receive_time_ahead"]
+    (entry,) = [r for r in caplog.records if r.msg.startswith("source_receive_time_ahead ")]
     assert entry.levelno == logging.WARNING  # above 100 ms
-    assert entry.lead_seconds == pytest.approx(0.25)
+    assert entry.getMessage() == "source_receive_time_ahead partition=0 lead_seconds=0.250"
 
     # An idle consumer polls only until the held partition is due.
     clock.value = 100.2
@@ -223,7 +223,7 @@ def test_lead_under_100_ms_is_logged_at_info(monkeypatch, clock, caplog):
     worker = source(monkeypatch, [[record(0, 5)]], ahead(0.01, 5))
     with caplog.at_level(logging.INFO, logger=kafka_source.__name__):
         assert worker.turn() == 0
-    (entry,) = [r for r in caplog.records if r.getMessage() == "source_receive_time_ahead"]
+    (entry,) = [r for r in caplog.records if r.msg.startswith("source_receive_time_ahead ")]
     assert entry.levelno == logging.INFO
     assert worker.db.statements() == []
     assert worker.retries.failed[(TOPIC, 0)][1] == pytest.approx(100.02)
