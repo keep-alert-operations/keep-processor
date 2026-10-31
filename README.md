@@ -26,3 +26,11 @@ packages without changing release dependency pins.
 
 `poetry run appchi-processor` is the entrypoint. Supply the documented environment
 bindings; package installation does not start services or migrate data.
+
+`python -m appchi.provider_backfill` is the one-time REV-55 provider backfill. Run it
+with the processor's bindings after migration 0060, once every source processor
+stores providers. It sets `provider` and `alert_rule_url` on each live alert that
+lacks a provider, from the alert's latest applied source event, and publishes a
+non-semantic projection change. Writers can keep running, and a rerun changes
+nothing. It prints one JSON line per tenant; `unresolved` lists alerts whose latest
+source event is missing. `--tenant` limits it to one tenant.
