@@ -11,9 +11,9 @@ import psycopg.errors
 import pytest
 from confluent_kafka import KafkaError, KafkaException, TopicPartition, Uuid
 
-from appchi.kafka_changed import PartitionRetries
-from appchi.kafka_source import SourceConsumer, same_topic, topic_identity
-from appchi.shared.errors import AppError, unavailable
+from keep.kafka_changed import PartitionRetries
+from keep.kafka_source import SourceConsumer, same_topic, topic_identity
+from keep.shared.errors import AppError, unavailable
 from test_source_partition_batching import TOPIC, applied_offsets, changed, record, source
 
 # The local broker's received and changed topics, as kafka-topics.sh prints them.
@@ -103,7 +103,7 @@ def assigning(monkeypatch, recorded, observed, committed=(7,)):
     """A source worker about to receive its partitions, with stand-in clients."""
     producer = Mock()
     monkeypatch.setattr("confluent_kafka.Producer", producer)
-    monkeypatch.setattr("appchi.service_clients.kafka_options", lambda settings: {})
+    monkeypatch.setattr("keep.service_clients.kafka_options", lambda settings: {})
     msb, lsb = halves(observed)
     worker = SourceConsumer.__new__(SourceConsumer)
     worker.db = Database()
@@ -174,7 +174,7 @@ def test_coordinate_conflict_fences_the_partition_until_explicit_repair(monkeypa
         return changed(partition, offset)
 
     worker = source(monkeypatch, [[record(0, 3), record(0, 4), record(0, 5), record(1, 9)]], apply)
-    caplog.set_level(logging.WARNING, logger="appchi.kafka_source")
+    caplog.set_level(logging.WARNING, logger="keep.kafka_source")
     assert worker.turn() == 2
     assert applied_offsets() == [(0, 3), (0, 4), (1, 9)]
     point, deadline = worker.retries.failed[(TOPIC, 0)]
@@ -190,7 +190,7 @@ def test_coordinate_conflict_fences_the_partition_until_explicit_repair(monkeypa
     assert entry.levelno == logging.ERROR
     assert entry.getMessage() == (
         "source_partition_fenced partition=0 offset=4 reason=source_coordinate_conflict "
-        "error_class=appchi.shared.errors.AppError error_code=source_coordinate_conflict"
+        "error_class=keep.shared.errors.AppError error_code=source_coordinate_conflict"
     )
 
 
@@ -205,7 +205,7 @@ def test_coordinate_conflict_fences_the_partition_until_explicit_repair(monkeypa
         (ValueError("synthetic-private-payload"), "builtins.ValueError", "-"),
         (
             unavailable("cel_compilation_unavailable"),
-            "appchi.shared.errors.AppError",
+            "keep.shared.errors.AppError",
             "cel_compilation_unavailable",
         ),
     ],
@@ -219,7 +219,7 @@ def test_generic_failure_logs_class_and_code_never_text(
         raise error
 
     worker = source(monkeypatch, [[record(0, 8)]], apply)
-    caplog.set_level(logging.WARNING, logger="appchi.kafka_source")
+    caplog.set_level(logging.WARNING, logger="keep.kafka_source")
     assert worker.turn() == 0
     [fault] = worker.db.statements()
     assert fault[0][1][3] == "source_processing_failed"

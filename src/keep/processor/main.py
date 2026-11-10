@@ -1,7 +1,7 @@
 """Source processor process entrypoint."""
 
-from appchi.kafka_source import SourceConsumer
-from appchi.pipeline_runtime import run
+from keep.kafka_source import SourceConsumer
+from keep.pipeline_runtime import run
 
 
 def main():

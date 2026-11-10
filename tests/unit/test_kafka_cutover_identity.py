@@ -8,12 +8,12 @@ from unittest.mock import Mock
 
 import pytest
 
-from appchi import kafka_cutover
-from appchi.shared.errors import AppError
+from keep import kafka_cutover
+from keep.shared.errors import AppError
 from test_source_topic_incarnation import CHANGED, RECEIVED, halves, signed
 
 ENV = "development"
-TOPICS = {stream: f"appchi.{ENV}.alerts.{stream}" for stream in ("received", "changed")}
+TOPICS = {stream: f"keep.{ENV}.alerts.{stream}" for stream in ("received", "changed")}
 RETAINED = b"retained-input-11"
 
 
@@ -80,7 +80,7 @@ def broker(monkeypatch, *, high=None, counts=None, record=RETAINED, members=()):
     make_consumer = Mock(return_value=consumer)
     monkeypatch.setattr("confluent_kafka.admin.AdminClient", Mock(return_value=admin))
     monkeypatch.setattr("confluent_kafka.Consumer", make_consumer)
-    monkeypatch.setattr("appchi.service_clients.kafka_options", lambda settings: {})
+    monkeypatch.setattr("keep.service_clients.kafka_options", lambda settings: {})
     return admin, consumer, make_consumer
 
 

@@ -1,6 +1,6 @@
 """Folded coordinator statements against isolated real PostgreSQL (no broker).
 
-Run with APPCHI_TEST_DATABASE_URL pointing at a disposable database.
+Run with KEEP_TEST_DATABASE_URL pointing at a disposable database.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -11,15 +11,15 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
-from appchi import kafka_source
-from appchi.db import BudgetConnection
-from appchi.event_models import KafkaReceivedEnvelope
-from appchi.ingestion.keys import received_key
-from appchi.ingestion.native import canonical, identity, validate_native
-from appchi.request_budget import request_budget
-from appchi.serialization import wire
-from appchi.shared.errors import AppError
-from appchi.shared.transactions import coordinator
+from keep import kafka_source
+from keep.db import BudgetConnection
+from keep.event_models import KafkaReceivedEnvelope
+from keep.ingestion.keys import received_key
+from keep.ingestion.native import canonical, identity, validate_native
+from keep.request_budget import request_budget
+from keep.serialization import wire
+from keep.shared.errors import AppError
+from keep.shared.transactions import coordinator
 
 pytestmark = pytest.mark.integration
 
@@ -60,7 +60,7 @@ def counted(monkeypatch):
 
 @pytest.fixture
 def context_relocks(monkeypatch):
-    from appchi.incidents import state
+    from keep.incidents import state
 
     calls = []
     original = state.lock_contexts
@@ -104,7 +104,7 @@ def record(config, payload, at=None):
         }
     )
     return (
-        f"appchi.{config.environment}.alerts.received",
+        f"keep.{config.environment}.alerts.received",
         received_key(config.global_tenant_id, payload["application"], key),
         canonical(body.model_dump()),
     )

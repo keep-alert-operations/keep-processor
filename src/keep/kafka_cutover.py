@@ -7,11 +7,11 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from appchi.cel import compile_expression
-from appchi.config import Settings
-from appchi.db import Database
-from appchi.kafka_source import same_topic, topic_identity
-from appchi.shared.errors import unavailable
+from keep.cel import compile_expression
+from keep.config import Settings
+from keep.db import Database
+from keep.kafka_source import same_topic, topic_identity
+from keep.shared.errors import unavailable
 from pathlib import Path
 
 STREAMS = ("received", "changed")
@@ -47,7 +47,7 @@ def require_drained(conn):
 def require_groups_stopped(admin, settings):
     from confluent_kafka import ConsumerGroupState, KafkaException, KafkaError
 
-    identities = [f"appchi.{settings.environment}.{role}-v2" for role in GROUPS]
+    identities = [f"keep.{settings.environment}.{role}-v2" for role in GROUPS]
     for future in admin.describe_consumer_groups(identities, request_timeout=5).values():
         try:
             description = future.result(6)
@@ -65,7 +65,7 @@ def require_groups_stopped(admin, settings):
 def activate(db, settings):
     from confluent_kafka import Consumer, TopicPartition
     from confluent_kafka.admin import AdminClient
-    from appchi.service_clients import kafka_options
+    from keep.service_clients import kafka_options
 
     blocked = inspect_rules(db)
     with db.transaction() as conn:
@@ -78,7 +78,7 @@ def activate(db, settings):
     # The source refuses any later topic incarnation (a recreated topic
     # restarts its offsets under the replay proof recorded from this one).
     topic_ids = {
-        stream: topic_identity(admin, f"appchi.{settings.environment}.alerts.{stream}")
+        stream: topic_identity(admin, f"keep.{settings.environment}.alerts.{stream}")
         for stream in STREAMS
     }
     offsets = {}
@@ -86,12 +86,12 @@ def activate(db, settings):
         client = Consumer(
             {
                 **kafka_options(settings),
-                "group.id": f"appchi.{settings.environment}.{role}-v2",
+                "group.id": f"keep.{settings.environment}.{role}-v2",
                 "enable.auto.commit": False,
             }
         )
         try:
-            topic = f"appchi.{settings.environment}.alerts.{stream}"
+            topic = f"keep.{settings.environment}.alerts.{stream}"
             metadata = client.list_topics(topic, timeout=5).topics[topic]
             if metadata.error:
                 raise unavailable("cutover_topic_unavailable")
@@ -203,7 +203,7 @@ def record_topic_identity(db, settings):
     """
     from confluent_kafka import Consumer
     from confluent_kafka.admin import AdminClient
-    from appchi.service_clients import kafka_options
+    from keep.service_clients import kafka_options
 
     with db.transaction() as conn:
         state = conn.execute("SELECT * FROM kafka_pipeline_control WHERE singleton").fetchone()
@@ -213,7 +213,7 @@ def record_topic_identity(db, settings):
         raise unavailable("kafka_topic_identity_migration_required")
     admin = AdminClient(kafka_options(settings))
     require_groups_stopped(admin, settings)
-    topics =[f"appchi.{settings.environment}.alerts.{stream}" for stream in STREAMS]
+    topics =[f"keep.{settings.environment}.alerts.{stream}" for stream in STREAMS]
     observed = dict(zip(STREAMS, (topic_identity(admin, topic) for topic in topics)))
     previous = {stream: state[f"{stream}_topic_id"] for stream in STREAMS}
     if all(previous[s] and same_topic(previous[s], observed[s]) for s in STREAMS):
@@ -222,7 +222,7 @@ def record_topic_identity(db, settings):
     consumer = Consumer(
         {
             **kafka_options(settings),
-            "group.id": f"appchi.{settings.environment}.topic-identity-{uuid4()}",
+            "group.id": f"keep.{settings.environment}.topic-identity-{uuid4()}",
             "enable.auto.commit": False,
             "enable.auto.offset.store": False,
         }

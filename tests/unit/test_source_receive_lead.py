@@ -11,11 +11,11 @@ import logging
 
 import pytest
 
-from appchi import clock_health, kafka_changed, kafka_source
-from appchi.kafka_changed import PartitionRetries
-from appchi.kafka_source import ReceiveTimeAhead, SourceConsumer
+from keep import clock_health, kafka_changed, kafka_source
+from keep.kafka_changed import PartitionRetries
+from keep.kafka_source import ReceiveTimeAhead, SourceConsumer
 
-TOPIC = "appchi.test.alerts.received"
+TOPIC = "keep.test.alerts.received"
 TENANT = uuid4()
 NOW = datetime(2026, 10, 19, 21, 26, 29, 792700, tzinfo=UTC)
 
@@ -84,7 +84,7 @@ def applied(monkeypatch):
         calls.append(supplied_item)
         return {"alert_id": uuid4(), "error_code": None, "envelope": b"{}", "event_id": "evt"}
 
-    monkeypatch.setattr("appchi.alerts.processor._apply_one", fake_apply_one)
+    monkeypatch.setattr("keep.alerts.processor._apply_one", fake_apply_one)
     return calls
 
 
