@@ -17,13 +17,13 @@ jobs:
         run: python -m pip install poetry==2.3.1
       - name: Authenticate private dependencies
         env:
-          KEEP_TOKEN: ${{ secrets.APPCHI_REPOSITORIES_TOKEN }}
+          KEEP_TOKEN: ${{ secrets.KEEP_REPOSITORIES_TOKEN }}
         run: |
-          test -n "$KEEP_TOKEN" || { echo 'Configure APPCHI_REPOSITORIES_TOKEN with read access to the Keep repositories.'; exit 1; }
+          test -n "$KEEP_TOKEN" || { echo 'Configure KEEP_REPOSITORIES_TOKEN with read access to the Keep repositories.'; exit 1; }
           git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$KEEP_TOKEN"; }; f'
       - name: Locked install and checks
         env:
-          KEEP_TOKEN: ${{ secrets.APPCHI_REPOSITORIES_TOKEN }}
+          KEEP_TOKEN: ${{ secrets.KEEP_REPOSITORIES_TOKEN }}
         run: |
           poetry check --lock
           poetry sync --all-extras
