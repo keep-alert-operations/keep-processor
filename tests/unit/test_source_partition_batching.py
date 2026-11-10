@@ -10,13 +10,13 @@ import json
 import pytest
 from confluent_kafka import KafkaError, KafkaException, TopicPartition
 
-from appchi import clock_health, kafka_source
-from appchi.kafka_changed import PartitionRetries
-from appchi.kafka_source import SourceConsumer
-from appchi.shared.errors import AppError, unavailable
+from keep import clock_health, kafka_source
+from keep.kafka_changed import PartitionRetries
+from keep.kafka_source import SourceConsumer
+from keep.shared.errors import AppError, unavailable
 
-TOPIC = "appchi.test.alerts.received"
-CHANGED = "appchi.test.alerts.changed"
+TOPIC = "keep.test.alerts.received"
+CHANGED = "keep.test.alerts.changed"
 TENANT = uuid4()
 
 

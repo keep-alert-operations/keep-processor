@@ -9,10 +9,10 @@ import argparse
 import json
 from uuid import UUID
 
-from appchi.alert_notifications import configure
-from appchi.alerts.provider_backfill import BATCH, backfill_tenant
-from appchi.config import Settings
-from appchi.db import Database
+from keep.alert_notifications import configure
+from keep.alerts.provider_backfill import BATCH, backfill_tenant
+from keep.config import Settings
+from keep.db import Database
 
 
 def main():

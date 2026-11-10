@@ -9,12 +9,12 @@ import logging
 
 from psycopg.errors import UniqueViolation
 
-from appchi.event_models import KafkaReceivedEnvelope
-from appchi.ingestion.keys import received_key
-from appchi.ingestion.native import identity, parse_json, validate_native
-from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import advance_clock, lock_coordinator
-from appchi.kafka_changed import PartitionRetries
+from keep.event_models import KafkaReceivedEnvelope
+from keep.ingestion.keys import received_key
+from keep.ingestion.native import identity, parse_json, validate_native
+from keep.shared.errors import AppError, unavailable
+from keep.shared.transactions import advance_clock, lock_coordinator
+from keep.kafka_changed import PartitionRetries
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
     """Apply one input; return its unconfirmed ``ChangedEvent`` or None."""
     envelope = KafkaReceivedEnvelope.model_validate(parse_json(value))
     tenant = UUID(envelope.tenant_id)
-    if topic != f"appchi.{settings.environment}.alerts.received":
+    if topic != f"keep.{settings.environment}.alerts.received":
         raise unavailable("source_topic_mismatch")
     if envelope.native_version == "v1" and tenant != settings.global_tenant_id:
         raise unavailable("source_global_scope_mismatch")
@@ -107,7 +107,7 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
     ):
         raise unavailable("source_identity_proof_invalid")
     digest = sha256(value).digest()
-    from appchi.maintenance.runtime import prepare_for_tenant
+    from keep.maintenance.runtime import prepare_for_tenant
 
     at = datetime.fromisoformat(envelope.received_at.replace("Z", "+00:00"))
     application = dict(
@@ -170,7 +170,7 @@ def _apply_record_locked(
     catalog,
 ):
     """Apply validated delivery and proof in the caller's guarded transaction."""
-    from appchi.alerts.processor import _apply_one
+    from keep.alerts.processor import _apply_one
 
     # One coordinator acquisition serves the whole source application. The
     # clock check precedes any write and, on a first application, also
@@ -290,7 +290,7 @@ class SourceConsumer:
     def __init__(self, db, settings, profile):
         from confluent_kafka import Consumer
         from confluent_kafka.admin import AdminClient
-        from appchi.service_clients import kafka_options
+        from keep.service_clients import kafka_options
 
         self.db, self.settings, self.profile = db, settings, profile
         with db.transaction() as conn:
@@ -305,7 +305,7 @@ class SourceConsumer:
         self.client = Consumer(
             {
                 **kafka_options(settings),
-                "group.id": f"appchi.{settings.environment}.source-v2",
+                "group.id": f"keep.{settings.environment}.source-v2",
                 "enable.auto.commit": False,
                 "enable.auto.offset.store": False,
                 "isolation.level": "read_committed",
@@ -315,7 +315,7 @@ class SourceConsumer:
         )
         self.retries = PartitionRetries(self.client)
         self.client.subscribe(
-            [f"appchi.{settings.environment}.alerts.received"],
+            [f"keep.{settings.environment}.alerts.received"],
             on_assign=self._assigned,
             on_revoke=self._revoked,
         )
@@ -324,9 +324,9 @@ class SourceConsumer:
         if self.closing:
             return
         from confluent_kafka import Producer
-        from appchi.service_clients import kafka_options
+        from keep.service_clients import kafka_options
 
-        topic = f"appchi.{self.settings.environment}.alerts.received"
+        topic = f"keep.{self.settings.environment}.alerts.received"
         self._require_topic_identity(consumer, topic, partitions)
         metadata = consumer.list_topics(topic, timeout=5)
         if len(metadata.topics[topic].partitions) != self.control["received_partitions"]:
@@ -337,7 +337,7 @@ class SourceConsumer:
             producer = Producer(
                 {
                     **kafka_options(self.settings),
-                    "transactional.id": f"appchi.{self.settings.environment}.source-v2.{p.partition}",
+                    "transactional.id": f"keep.{self.settings.environment}.source-v2.{p.partition}",
                     "enable.idempotence": True,
                     "acks": "all",
                     "transaction.timeout.ms": 30000,
@@ -465,7 +465,7 @@ class SourceConsumer:
         for _, changed in applied:
             if changed:
                 producer.produce(
-                    f"appchi.{self.settings.environment}.alerts.changed",
+                    f"keep.{self.settings.environment}.alerts.changed",
                     key=changed.tenant.bytes,
                     value=changed,
                 )

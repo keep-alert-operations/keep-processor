@@ -1,10 +1,10 @@
 [project]
-name = "appchi-processor"
+name = "keep-processor"
 version = "0.1.0"
 description = "Kafka source processing, immutable PostgreSQL replay proof and transactional changed-event publication."
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "appchi-domain[runtime] @ git+https://github.com/appchi-alert-operations/appchi-domain.git@71a79f56606cf0e2df7909125beeb701a34639fd"
+  "keep-domain[runtime] @ git+https://github.com/keep-alert-operations/keep-domain.git@f24a015c57ec44dc27d13fcb6781eaa20fa878db"
 ]
 
 [dependency-groups]
@@ -15,7 +15,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/appchi"]
+packages = ["src/keep"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -30,7 +30,7 @@ line-length = 100
 select = ["E4", "E7", "E9", "F"]
 
 [project.scripts]
-appchi-processor = "appchi.processor.main:main"
+keep-processor = "keep.processor.main:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -38,7 +38,7 @@ allow-direct-references = true
 [tool.poetry]
 requires-poetry = "==2.3.1"
 packages = [
-  { include = "appchi", from = "src" },
+  { include = "keep", from = "src" },
 ]
 
 # Resolve-only pins preserve the coordinated baseline without adding runtime requirements.

@@ -1,13 +1,13 @@
 """Another delivery at a recorded source coordinate, against isolated real PostgreSQL.
 
-Run with APPCHI_TEST_DATABASE_URL pointing at a disposable database.
+Run with KEEP_TEST_DATABASE_URL pointing at a disposable database.
 """
 
 import json
 
 import pytest
 
-from appchi.shared.errors import AppError
+from keep.shared.errors import AppError
 from test_source_critical_section_pg import apply, record, settings, work
 
 pytestmark = pytest.mark.integration

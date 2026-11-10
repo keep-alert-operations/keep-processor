@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 
-from appchi import kafka_source
-from appchi.shared.errors import AppError
+from keep import kafka_source
+from keep.shared.errors import AppError
 
 BASE = datetime(2026, 10, 18, tzinfo=UTC)
 
@@ -81,7 +81,7 @@ def application(tenant, event_id=None, operator_id=None):
         logical_key="key",
         at=BASE - timedelta(seconds=1),
         digest=sha256(b"value").digest(),
-        topic="appchi.test.alerts.received",
+        topic="keep.test.alerts.received",
         partition=0,
         offset=3,
         catalog=None,
@@ -96,7 +96,7 @@ def applied(monkeypatch):
         calls.append({"supplied_item": supplied_item, "coordinated": coordinated})
         return {"alert_id": uuid4(), "error_code": None, "envelope": b"{}", "event_id": "evt-1"}
 
-    monkeypatch.setattr("appchi.alerts.processor._apply_one", fake_apply_one)
+    monkeypatch.setattr("keep.alerts.processor._apply_one", fake_apply_one)
     return calls
 
 

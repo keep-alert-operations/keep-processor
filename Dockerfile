@@ -11,7 +11,7 @@ RUN --mount=type=secret,id=apt_sources --mount=type=secret,id=build_ca \
     if [ -f /run/secrets/build_ca ]; then \
         if grep -q 'PRIVATE KEY' /run/secrets/build_ca; then exit 1; fi; \
         mkdir -p /usr/local/share/ca-certificates /etc/ssl/certs; \
-        cp /run/secrets/build_ca /usr/local/share/ca-certificates/appchi-build-ca.crt; \
+        cp /run/secrets/build_ca /usr/local/share/ca-certificates/keep-build-ca.crt; \
         cat /run/secrets/build_ca >> /etc/ssl/certs/ca-certificates.crt; \
     fi; \
     apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
@@ -40,12 +40,12 @@ RUN --mount=type=secret,id=github_token --mount=type=secret,id=build_environment
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
     export PIP_CERT="$SSL_CERT_FILE" REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"; \
     export GIT_SSL_CAINFO="$SSL_CERT_FILE" NODE_EXTRA_CA_CERTS="$SSL_CERT_FILE"; \
-    export GIT_CONFIG_GLOBAL=/tmp/appchi-build-gitconfig; \
-    if [ -n "${APPCHI_GIT_BASE_URL:-}" ]; then \
-        case "$APPCHI_GIT_BASE_URL" in https://*/ ) ;; *) exit 1 ;; esac; \
-        case "$APPCHI_GIT_BASE_URL" in *'@'*|*'?'*|*'#'*) exit 1 ;; esac; \
-        git config --global url."$APPCHI_GIT_BASE_URL".insteadOf https://github.com/appchi-alert-operations/; \
-        git config --global --add url."$APPCHI_GIT_BASE_URL".insteadOf ssh://git@github.com/appchi-alert-operations/; \
+    export GIT_CONFIG_GLOBAL=/tmp/keep-build-gitconfig; \
+    if [ -n "${KEEP_GIT_BASE_URL:-}" ]; then \
+        case "$KEEP_GIT_BASE_URL" in https://*/ ) ;; *) exit 1 ;; esac; \
+        case "$KEEP_GIT_BASE_URL" in *'@'*|*'?'*|*'#'*) exit 1 ;; esac; \
+        git config --global url."$KEEP_GIT_BASE_URL".insteadOf https://github.com/keep-alert-operations/; \
+        git config --global --add url."$KEEP_GIT_BASE_URL".insteadOf ssh://git@github.com/keep-alert-operations/; \
     else \
         git config --global url."https://github.com/".insteadOf ssh://git@github.com/; \
     fi; \
@@ -67,16 +67,16 @@ RUN --mount=type=secret,id=apt_sources --mount=type=secret,id=build_ca \
     if [ -f /run/secrets/build_ca ]; then \
         if grep -q 'PRIVATE KEY' /run/secrets/build_ca; then exit 1; fi; \
         mkdir -p /usr/local/share/ca-certificates /etc/ssl/certs; \
-        cp /run/secrets/build_ca /usr/local/share/ca-certificates/appchi-build-ca.crt; \
+        cp /run/secrets/build_ca /usr/local/share/ca-certificates/keep-build-ca.crt; \
         cat /run/secrets/build_ca >> /etc/ssl/certs/ca-certificates.crt; \
     fi; \
     apt-get update && apt-get install -y --no-install-recommends libstdc++6 ca-certificates && \
     update-ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
-ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 APPCHI_BIND_HOST=0.0.0.0
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 KEEP_BIND_HOST=0.0.0.0
 RUN chgrp -R 0 /app && chmod -R g=rX /app
 USER 1001:0
 # Compile a checked native expression without contacting configured services.
-RUN python -c "import appchi.processor.main; from cel_expr_python import cel; assert cel.NewEnv().compile('true').return_type() == cel.Type.BOOL"
-CMD ["python", "-m", "appchi.processor.main"]
+RUN python -c "import keep.processor.main; from cel_expr_python import cel; assert cel.NewEnv().compile('true').return_type() == cel.Type.BOOL"
+CMD ["python", "-m", "keep.processor.main"]

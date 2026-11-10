@@ -4,9 +4,9 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from appchi.db import Database
-from appchi.kafka_changed import PartitionRetries
-from appchi.kafka_source import SourceConsumer
+from keep.db import Database
+from keep.kafka_changed import PartitionRetries
+from keep.kafka_source import SourceConsumer
 from test_source_partition_batching import changed, record
 
 XACT_LOCK = "pg_try_advisory_xact_lock_shared"
