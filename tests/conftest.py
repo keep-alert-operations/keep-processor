@@ -2,6 +2,8 @@ import os
 from uuid import uuid4
 import pytest
 
+from keep.observability.testing import restore_logging, strict_log_events  # noqa: F401
+
 
 
 @pytest.fixture(scope="session")
