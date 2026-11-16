@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Kafka source processing, immutable PostgreSQL replay proof and transactional changed-event publication."
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "keep-domain[runtime] @ git+https://github.com/keep-alert-operations/keep-domain.git@9e6f24147d2183281e90a875f622604d094cc3e6"
+  "keep-domain[runtime] @ git+https://github.com/keep-alert-operations/keep-domain.git@47b825773249f6cfd378e7f470d87a3a63138e5c"
 ]
 
 [dependency-groups]
