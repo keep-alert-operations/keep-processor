@@ -12,11 +12,93 @@ from psycopg.errors import UniqueViolation
 from keep.event_models import KafkaReceivedEnvelope
 from keep.ingestion.keys import received_key
 from keep.ingestion.native import identity, parse_json, validate_native
+from keep.observability import Flow, alert_fields, flow as alert_flow, register
+from keep.observability.kafka import statistics_options
 from keep.shared.errors import AppError, unavailable
 from keep.shared.transactions import advance_clock, lock_coordinator
-from keep.kafka_changed import PartitionRetries
+from keep.kafka_changed import PartitionRetries, seconds_since
 
 log = logging.getLogger(__name__)
+
+# The steps one delivered input takes inside the source processor (observability 3).
+# Each is its own record carrying the delivery ID, the key digest, the Kafka position
+# and, once known, the alert ID. A step describing a PostgreSQL effect is written
+# only after that transaction commits. ``alert_applied`` and ``alert_refused`` are
+# registered with the shared code that decides them.
+register(
+    "alert_consumed",
+    logging.INFO,
+    "Read delivery {delivery_id} from partition {partition} at offset {offset}",
+    "The source processor read one accepted input from Kafka and its payload is valid. "
+    "delay_seconds is the time since ingestion received it.",
+    required=("delivery_id", "partition", "offset", "alert"),
+    outcome="success",
+)
+register(
+    "alert_matched",
+    logging.INFO,
+    "Identity lookup for delivery {delivery_id}: {outcome}",
+    "The alert identity was looked up. outcome is existing_alert (the delivery updates "
+    "that alert) or new_alert (it will create one).",
+    required=("delivery_id", "outcome", "alert"),
+    outcome="success",
+)
+register(
+    "alert_replayed",
+    logging.INFO,
+    "Delivery {delivery_id} was already applied ({outcome}); its stored result is reused",
+    "This delivery has a stored result, so nothing is applied again. outcome is replayed "
+    "(the same Kafka position, read again after a restart or retry) or duplicate (the "
+    "same delivery at another position).",
+    required=("delivery_id", "outcome"),
+    outcome="success",
+)
+register(
+    "alert_change_published",
+    logging.INFO,
+    "Kafka committed the changed event of delivery {delivery_id} and input offset {offset}",
+    "The Kafka transaction that publishes the alert change and advances the input offset "
+    "committed. Correlation and the indexer continue from the changed event.",
+    required=("partition", "offset"),
+    outcome="success",
+)
+register(
+    "alert_input_committed",
+    logging.INFO,
+    "Kafka committed input offset {offset}; delivery {delivery_id} had no change to publish",
+    "The input offset advanced. The delivery produced no changed event: it was refused, "
+    "or it was a replay whose change is already confirmed.",
+    required=("partition", "offset"),
+    outcome="success",
+)
+register(
+    "source_receive_time_ahead",
+    logging.INFO,
+    "Delivery {delivery_id} was received {lead_seconds} s ahead of the tenant clock; "
+    "partition {partition} waits for it",
+    "Ingestion stamped the receipt slightly ahead of the tenant clock. The partition is "
+    "held until the clock passes it. Above 100 ms this is a warning; check host clocks.",
+    required=("partition", "lead_seconds"),
+    outcome="unknown",
+)
+register(
+    "source_partition_retry",
+    logging.WARNING,
+    "Could not apply offset {offset} of partition {partition}: {reason}; it is retried",
+    "An input failed. The partition is held at this offset and retried; a fault row is "
+    "recorded. error.type and error.code or keep.sqlstate name the cause.",
+    required=("partition", "offset", "reason"),
+    outcome="failure",
+)
+register(
+    "source_partition_fenced",
+    logging.ERROR,
+    "Partition {partition} is fenced at offset {offset}: {reason}",
+    "The broker log is not the one PostgreSQL proved. The partition stays held until a "
+    "reviewed reset and restart; see the Kafka runbook.",
+    required=("partition", "offset", "reason"),
+    outcome="failure",
+)
 
 # The clock-health contract bounds each host's offset at one second. A larger
 # receipt lead is a clock fault; a smaller one is waited out without a fault.
@@ -88,10 +170,43 @@ def _keyed(tenant, changed):
     return None if changed is None else ChangedEvent(changed, tenant)
 
 
+def _replayed(old, topic, partition, offset):
+    """The step recording that a delivery already has a stored result."""
+    same = (old["topic"], old["partition"], old["input_offset"]) == (topic, partition, offset)
+    stored = old.get("alert_id")
+    learned = {"changed_event_id": old.get("changed_event_id")}
+    if stored:
+        learned["alert"] = {"id": str(stored)}
+    return dict(
+        outcome="replayed" if same else "duplicate",
+        learned=learned,
+        error_code=old.get("error_code"),
+    )
+
+
 def apply_record(db, *, topic, partition, offset, key, value, settings, profile):
     """Apply one input; return its unconfirmed ``ChangedEvent`` or None."""
+    flow = alert_flow.active()
+    if flow is None:
+        # Called outside the consumer loop: the input still gets its own flow.
+        with Flow(log, partition=partition, offset=offset):
+            return apply_record(
+                db,
+                topic=topic,
+                partition=partition,
+                offset=offset,
+                key=key,
+                value=value,
+                settings=settings,
+                profile=profile,
+            )
     envelope = KafkaReceivedEnvelope.model_validate(parse_json(value))
     tenant = UUID(envelope.tenant_id)
+    flow.know(
+        delivery_id=envelope.event_id,
+        tenant_id=envelope.tenant_id,
+        operator_id=envelope.operator_id,
+    )
     if topic != f"keep.{settings.environment}.alerts.received":
         raise unavailable("source_topic_mismatch")
     if envelope.native_version == "v1" and tenant != settings.global_tenant_id:
@@ -100,6 +215,15 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
     logical_key, key_digest, material = identity(
         payload, envelope.native_version, envelope.operator_id
     )
+    flow.know(
+        alert=alert_fields(
+            payload,
+            key_digest=key_digest,
+            native_version=envelope.native_version,
+            provider="grafana" if envelope.adapter_version else "api",
+        )
+    )
+    flow.step("alert_consumed", detail=True, delay_seconds=seconds_since(envelope.received_at))
     if (
         key != received_key(tenant, payload["application"], logical_key)
         or logical_key != envelope.key_field
@@ -128,11 +252,19 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
             "SELECT * FROM kafka_source_results WHERE delivery_id=%s", (envelope.event_id,)
         ).fetchone()
         if old:
-            return _keyed(tenant, replay_result(old, tenant, digest, topic, partition, offset))
-        claim = conn.execute(
-            "SELECT alert_id FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
-            (tenant, envelope.native_version, key_digest),
-        ).fetchone()
+            stored = replay_result(old, tenant, digest, topic, partition, offset)
+        else:
+            claim = conn.execute(
+                "SELECT alert_id FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
+                (tenant, envelope.native_version, key_digest),
+            ).fetchone()
+    if old:
+        flow.note("alert_replayed", **_replayed(old, topic, partition, offset))
+        flow.settle()
+        return _keyed(tenant, stored)
+    if claim:
+        flow.know(alert={"id": str(claim["alert_id"])})
+    flow.step("alert_matched", detail=True, outcome="existing_alert" if claim else "new_alert")
     catalog = prepare_for_tenant(
         db,
         tenant,
@@ -150,7 +282,10 @@ def apply_record(db, *, topic, partition, offset, key, value, settings, profile)
         },
     )
     with db.transaction(tenant) as conn:
-        return _keyed(tenant, _apply_record_locked(conn, catalog=catalog, **application))
+        changed = _apply_record_locked(conn, catalog=catalog, **application)
+    # Committed: the steps held for this transaction are now true.
+    flow.settle()
+    return _keyed(tenant, changed)
 
 
 def _apply_record_locked(
@@ -181,6 +316,7 @@ def _apply_record_locked(
     ).fetchone()
     if old:
         advance_clock(conn, tenant)
+        alert_flow.note("alert_replayed", **_replayed(old, topic, partition, offset))
         return replay_result(old, tenant, digest, topic, partition, offset)
     now, order = advance_clock(conn, tenant, admission=True)
     if at > now:
@@ -208,6 +344,14 @@ def _apply_record_locked(
         result = {"alert_id": None, "error_code": "operator_deleted", "envelope": None}
     elif retired and at <= retired["retired_at"]:
         result = {"alert_id": None, "error_code": "retired_receipt", "envelope": None}
+    else:
+        result = None
+    if result is not None:
+        alert_flow.note(
+            "alert_refused",
+            alert=alert_fields(payload, whole=True),
+            error_code=result["error_code"],
+        )
     else:
         result = _apply_one(
             conn,
@@ -286,6 +430,8 @@ class SourceConsumer:
     # partition batch closes after 100 milliseconds of application.
     batch_records = 100
     batch_seconds = 0.1
+    # The flow of each applied input until its Kafka transaction commits.
+    flows = None
 
     def __init__(self, db, settings, profile):
         from confluent_kafka import Consumer
@@ -305,6 +451,10 @@ class SourceConsumer:
         self.client = Consumer(
             {
                 **kafka_options(settings),
+                # The consumer only. The per-partition producers are made and dropped
+                # inside its rebalance callback and must not carry a statistics
+                # callback: the Kafka library crashes the process when they do.
+                **statistics_options(),
                 "group.id": f"keep.{settings.environment}.source-v2",
                 "enable.auto.commit": False,
                 "enable.auto.offset.store": False,
@@ -429,23 +579,28 @@ class SourceConsumer:
 
     def _apply_batch(self, producer, batch):
         applied, progress, started = [], 0, monotonic()
+        if self.flows is None:
+            self.flows = {}
         for message in batch:
+            flow = Flow(log, partition=message.partition(), offset=message.offset())
             try:
-                changed = apply_record(
-                    self.db,
-                    topic=message.topic(),
-                    partition=message.partition(),
-                    offset=message.offset(),
-                    key=message.key(),
-                    value=message.value(),
-                    settings=self.settings,
-                    profile=self.profile,
-                )
+                with flow:
+                    changed = apply_record(
+                        self.db,
+                        topic=message.topic(),
+                        partition=message.partition(),
+                        offset=message.offset(),
+                        key=message.key(),
+                        value=message.value(),
+                        settings=self.settings,
+                        profile=self.profile,
+                    )
             except Exception as error:
                 # Commit the healthy prefix before retaining this exact offset.
                 progress += self._publish(producer, applied)
-                self._retain(message, error)
+                self._retain(message, error, flow)
                 return progress
+            self.flows[(message.partition(), message.offset())] = flow
             applied.append((message, changed))
             if monotonic() - started >= self.batch_seconds:
                 progress += self._publish(producer, applied)
@@ -459,6 +614,8 @@ class SourceConsumer:
         if not applied:
             return 0
         first, last = applied[0][0], applied[-1][0]
+        held = self.flows or {}
+        flows = [held.pop((message.partition(), message.offset()), None) for message, _ in applied]
         # Every input is already committed in PostgreSQL, so the transaction
         # timeout covers only this publication.
         producer.begin_transaction()
@@ -475,6 +632,12 @@ class SourceConsumer:
             5,
         )
         producer.commit_transaction(10)
+        for (_, changed), flow in zip(applied, flows):
+            if flow is not None:
+                flow.step(
+                    "alert_change_published" if changed else "alert_input_committed",
+                    duration=flow.elapsed(),
+                )
         # Neither write selects REPEATABLE READ, so the restore guard runs
         # inside this transaction instead of around it.
         with self.db.transaction(read_committed=True) as conn:
@@ -489,16 +652,19 @@ class SourceConsumer:
             )
         return len(applied)
 
-    def _retain(self, message, error):
+    def _retain(self, message, error, flow=None):
+        # The flow already names the delivery and alert as far as they were read.
+        flow = flow or Flow(log, partition=message.partition(), offset=message.offset())
         if isinstance(error, ReceiveTimeAhead) and error.lead <= RECEIVE_LEAD_LIMIT:
             # Healthy clocks still differ: hold only this partition until the
             # tenant clock passes the receipt. Not a fault; warn above 100 ms.
             self.retries.fail(message, delay=error.lead + RECEIVE_LEAD_MARGIN)
-            log.log(
-                logging.WARNING if error.lead > 0.1 else logging.INFO,
-                "source_receive_time_ahead partition=%d lead_seconds=%.3f",
-                message.partition(),
-                error.lead,
+            flow.step(
+                "source_receive_time_ahead",
+                level=logging.WARNING if error.lead > 0.1 else logging.INFO,
+                lead_seconds=error.lead,
+                line="source_receive_time_ahead partition=%d lead_seconds=%.3f"
+                % (message.partition(), error.lead),
             )
             return
         # Independent diagnostic transaction: do not roll this evidence back
@@ -520,7 +686,7 @@ class SourceConsumer:
         )
         # Only controlled identifiers: never exception text, which can carry
         # payload values (a constraint violation quotes its key, for example).
-        # No log handler is configured, so the fields belong in the message.
+        # The token line stays as it was; the record carries the same as fields.
         fields = (
             message.partition(),
             message.offset(),
@@ -545,15 +711,21 @@ class SourceConsumer:
             # Unknown proof fences the partition for explicit repair: hold this
             # offset with no retry deadline until a reviewed reset and restart.
             self.retries.fail(message, delay=float("inf"))
-            log.error(
-                "source_partition_fenced partition=%d offset=%d reason=%s error_class=%s error_code=%s",
-                *fields,
+            flow.step(
+                "source_partition_fenced",
+                exc=error,
+                reason=reason,
+                line="source_partition_fenced partition=%d offset=%d reason=%s error_class=%s error_code=%s"
+                % fields,
             )
             return
         self.retries.fail(message)
-        log.warning(
-            "source_partition_retry partition=%d offset=%d reason=%s error_class=%s error_code=%s",
-            *fields,
+        flow.step(
+            "source_partition_retry",
+            exc=error,
+            reason=reason,
+            line="source_partition_retry partition=%d offset=%d reason=%s error_class=%s error_code=%s"
+            % fields,
         )
 
     def close(self):
