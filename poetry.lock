@@ -736,8 +736,8 @@ runtime = ["cel-expr-python (==0.1.3)", "confluent-kafka (>=2.8,<3)", "elasticse
 [package.source]
 type = "git"
 url = "https://github.com/keep-alert-operations/keep-domain.git"
-reference = "762f122926be82cb0d2e1910ddda382f5ffe1a1b"
-resolved_reference = "762f122926be82cb0d2e1910ddda382f5ffe1a1b"
+reference = "28b0471e70225577464ecb57443385c4dd413ff7"
+resolved_reference = "28b0471e70225577464ecb57443385c4dd413ff7"
 
 [[package]]
 name = "ldap3"
@@ -1456,4 +1456,4 @@ standard = ["httptools (>=0.8.0)", "python-dotenv (>=0.13)", "pyyaml (>=5.1)", "
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "f3e175a412b5f727b4940e61db978331196430308c5796991be85effa9816965"
+content-hash = "1fc7188e448210687b447a38bf739a0e637392ec73ae823dec3979440b681042"
